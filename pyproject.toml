@@ -1,0 +1,29 @@
+[project]
+name = "taxifare-platform"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+ml = ["mlflow==2.22.2", "scikit-learn==1.6.1", "pandas>=2.2,<3", "pyarrow>=19,<20", "psycopg2-binary>=2.9,<3", "sqlalchemy>=2,<3", "requests>=2.32,<3"]
+api = [{include-group = "ml"}, "fastapi", "uvicorn[standard]"]
+pipeline = [{include-group = "ml"}, "prefect==3.4.25", "prefect-docker==0.6.6", "boto3", "pandera>=0.20,<0.27", "pyyaml>=6,<7"]
+mlflow = ["mlflow==2.22.2", "boto3", "psycopg2-binary"]
+dev = ["pytest", "httpx", "pytest-cov>=5,<7"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "e2e: needs the full stack running (make up); skipped otherwise",
+]
+
+[tool.coverage.run]
+source = ["services"]
+branch = true
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = true
+
+[tool.uv]
+constraint-dependencies = ["fastapi==0.115.12", "pydantic>=2.10,<2.12", "sqlalchemy>=2.0,<2.1"]

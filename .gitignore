@@ -1,0 +1,10 @@
+venv/
+data
+MC Monitoring.pdf
+.env
+
+.venv/
+__pycache__/
+.pytest_cache/
+*.pkl
+.coverage

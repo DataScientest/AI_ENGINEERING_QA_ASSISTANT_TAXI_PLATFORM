@@ -1,0 +1,5 @@
+# Single source of truth for the data-quality limits of the training pipeline.
+# Change a value here, rebuild the pipeline image, and the next run uses it. Nothing is hard-coded.
+validation:
+  max_invalid_share: 0.2        # more than 20% quarantined rows -> the ingestion fails (upstream problem)
+  min_valid_rows: 100           # fewer valid rows -> the ingestion fails
