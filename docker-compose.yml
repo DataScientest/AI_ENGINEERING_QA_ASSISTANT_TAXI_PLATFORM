@@ -1,0 +1,315 @@
+services:
+  db:
+    image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+    environment:
+    - POSTGRES_USER=${POSTGRES_USER:-admin}
+    - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    - POSTGRES_DB=nyc_taxi
+    ports:
+    - 5432:5432
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+    networks:
+    - ml-network
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U $${POSTGRES_USER} -d nyc_taxi
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  mlflow_server:
+    build:
+      context: .
+      dockerfile: services/mlflow/Dockerfile
+    ports:
+    - 5000:5000
+    volumes:
+    - mlflow_metadata:/mlflow-data
+    networks:
+    - ml-network
+    environment: &id001
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on:
+      minio_init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:5000/health')
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    image: taxi-mlflow:demo
+  prediction_api:
+    build:
+      context: .
+      dockerfile: services/prediction_api/Dockerfile
+    depends_on:
+      mlflow_server:
+        condition: service_healthy
+    environment:
+    - MLFLOW_TRACKING_URI=http://mlflow_server:5000
+    - CHAOS_ENABLED=${CHAOS_ENABLED:-true}
+    ports:
+    - 8000:8000
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    networks:
+    - ml-network
+  frontend:
+    image: nyc-taxi-frontend:demo
+    build:
+      context: .
+      dockerfile: services/frontend/Dockerfile
+    depends_on:
+    - prediction_api
+    - controller
+    environment:
+    - DATABASE_URL=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@db:5432/nyc_taxi
+    - PREDICTION_API_URL=http://prediction_api:8000
+    - PORTAL_USERNAME=${PORTAL_USERNAME:-demo}
+    - PORTAL_PASSWORD=${PORTAL_PASSWORD:?Set PORTAL_PASSWORD in .env}
+    - PUBLIC_HOST=${PUBLIC_HOST:-}
+    - MLFLOW_TRACKING_URI=http://mlflow_server:5000
+    ports:
+    - 8501:8501
+    networks:
+    - ml-network
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    volumes:
+    - ./services/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    - ./services/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml
+    - prometheus_data:/prometheus
+    depends_on:
+    - alertmanager
+    command:
+    - --config.file=/etc/prometheus/prometheus.yml
+    - --storage.tsdb.path=/prometheus
+    ports:
+    - 9090:9090
+    networks:
+    - ml-network
+  controller:
+    build:
+      context: .
+      dockerfile: services/controller/Dockerfile
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+    - ml-network
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    volumes:
+    - ./services/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    ports:
+    - 9093:9093
+    depends_on:
+    - alert_webhook
+    networks:
+    - ml-network
+  alert_webhook:
+    build:
+      context: .
+      dockerfile: services/alert_webhook/Dockerfile
+    ports:
+    - 8020:8020
+    networks:
+    - ml-network
+  grafana:
+    image: grafana/grafana:10.2.0
+    environment:
+    - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    - GF_USERS_ALLOW_SIGN_UP=false
+    - GF_DATABASE_WAL=true
+    - GF_SECURITY_ALLOW_EMBEDDING=true
+    - GF_AUTH_ANONYMOUS_ENABLED=true
+    - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+    - ./services/grafana/provisioning:/etc/grafana/provisioning
+    - ./services/grafana/dashboards:/var/lib/grafana/dashboards
+    - grafana_data:/var/lib/grafana
+    ports:
+    - 3000:3000
+    depends_on:
+    - prometheus
+    # On a brand-new volume Grafana can lose a SQLite migration race ("database is locked") and exit; retry.
+    restart: unless-stopped
+    networks:
+    - ml-network
+  monitoring_init:
+    image: nyc-taxi-frontend:demo
+    command: [python, services/frontend/configure_monitoring.py]
+    environment:
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    depends_on:
+      - grafana
+    restart: on-failure
+    networks:
+      - ml-network
+
+  loki:
+    image: grafana/loki:2.9.2
+    volumes:
+    - ./services/loki/loki-config.yml:/etc/loki/local-config.yaml
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+    - ${LOKI_PORT:-3101}:3100
+    networks:
+    - ml-network
+  promtail:
+    image: grafana/promtail:2.9.2
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ./services/promtail/promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+    - loki
+    networks:
+    - ml-network
+  tempo:
+    image: grafana/tempo:2.3.0
+    volumes:
+    - ./services/tempo/tempo-config.yml:/etc/tempo/tempo-config.yaml
+    command: -config.file=/etc/tempo/tempo-config.yaml
+    ports:
+    - 3200:3200
+    - 4317:4317
+    - 4318:4318
+    networks:
+    - ml-network
+  load_simulator:
+    build:
+      context: .
+      dockerfile: services/load_simulator/Dockerfile
+    environment:
+    - PREDICTION_API_URL=http://prediction_api:8000
+    - REQUESTS_PER_SECOND=2
+    depends_on:
+    - prediction_api
+    networks:
+    - ml-network
+  minio:
+    command:
+    - server
+    - /data
+    - --console-address
+    - :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    ports:
+    - 9000:9000
+    - 9001:9001
+    volumes:
+    - minio_data:/data
+    networks:
+    - ml-network
+    build:
+      context: .
+      dockerfile: services/minio/Dockerfile
+  minio_init:
+    image: taxi-mlflow:demo
+    entrypoint:
+    - python
+    - services/mlflow/init_bucket.py
+    environment: *id001
+    depends_on:
+    - minio
+    networks:
+    - ml-network
+  prefect_server:
+    image: nyc-taxi-pipeline:demo
+    build:
+      context: .
+      dockerfile: services/pipeline/Dockerfile
+    command:
+    - prefect
+    - server
+    - start
+    - --host
+    - 0.0.0.0
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: sqlite+aiosqlite:////prefect-data/prefect.db
+      # Relative, so the Prefect UI works from localhost and from a VM address alike.
+      PREFECT_UI_API_URL: /api
+    ports:
+    - 4200:4200
+    volumes:
+    - prefect_data:/prefect-data
+    networks:
+    - ml-network
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')
+      interval: 5s
+      timeout: 5s
+      retries: 90
+  prefect_bootstrap:
+    image: nyc-taxi-pipeline:demo
+    command:
+    - python
+    - services/pipeline/bootstrap.py
+    environment:
+      PREFECT_API_URL: http://prefect_server:4200/api
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@db:5432/nyc_taxi
+      MLFLOW_TRACKING_URI: http://mlflow_server:5000
+      PUSHGATEWAY_URL: http://pushgateway:9091
+      DEMO_ROWS: ${DEMO_ROWS:-5000}
+    depends_on:
+      prefect_server:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      mlflow_server:
+        condition: service_healthy
+    networks:
+    - ml-network
+  prefect_worker:
+    image: nyc-taxi-pipeline:demo
+    command:
+    - prefect
+    - worker
+    - start
+    - --pool
+    - taxi-docker
+    - --type
+    - docker
+    environment:
+      PREFECT_API_URL: http://prefect_server:4200/api
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      prefect_bootstrap:
+        condition: service_completed_successfully
+    networks:
+    - ml-network
+    restart: unless-stopped
+  pushgateway:
+    image: prom/pushgateway:v1.9.0
+    networks:
+    - ml-network
+volumes:
+  postgres_data: null
+  prometheus_data: null
+  grafana_data: null
+  mlflow_metadata: null
+  minio_data: null
+  prefect_data: null
+networks:
+  ml-network:
+    driver: bridge
+    name: nyc-taxi-ml

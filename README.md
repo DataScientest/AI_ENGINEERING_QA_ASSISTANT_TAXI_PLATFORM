@@ -1,0 +1,206 @@
+# TaxiFare platform: system under test for the QA Assistant subject
+
+TaxiFare is a fare-prediction platform for New York taxis: a prediction API, a training pipeline with data validation and drift detection, and a full monitoring stack (metrics, logs, traces, alerts). It is the system that teams test in the **QA Assistant** subject of the AI Engineering / LLMOps project catalogue.
+
+The platform works. Its automated test suite is deliberately incomplete: raising its coverage and its ability to catch defects, with the help of an assistant you build, is the point of the project.
+
+- Expected behaviour: [`docs/FUNCTIONAL_SPEC.md`](docs/FUNCTIONAL_SPEC.md). Tests take their expected results from it.
+- Operations: [`docs/RUNBOOKS.md`](docs/RUNBOOKS.md).
+- Tickets, team context and evaluation material: the QA Assistant folder of the project catalogue.
+
+This repository is a frozen snapshot (tag `v1.0`) of an observability masterclass, adapted to serve as a test target. Work on your own fork or copy.
+
+## Quick start
+
+Prerequisites: Docker with Compose v2 (daemon access) and internet (images + NYC TLC Parquet). For the tests: [uv](https://docs.astral.sh/uv/).
+
+```bash
+make up      # creates .env from .env.example if missing, builds and starts everything
+make down    # stops everything (data is kept)   ·   make reset  # stops and erases all data
+```
+
+First start: wait for the first Prefect run to finish (~2 min). The API answers 503 and `/health` is red until a champion model exists.
+The first build also compiles MinIO from its official source tag (public images are no longer published): several minutes, then cached.
+
+### URLs and demo credentials
+
+| Tool | URL | Login |
+|---|---|---|
+| **Streamlit portal** (start here) | http://localhost:8501 | `demo` / value of `PORTAL_PASSWORD` in `.env` |
+| Grafana | http://localhost:3000 | `admin` / `GRAFANA_ADMIN_PASSWORD` (anonymous Viewer is enabled for the iframes) |
+| Prometheus | http://localhost:9090 | – |
+| Alertmanager | http://localhost:9093 | – |
+| MLflow | http://localhost:5000 | – |
+| Evidently reports | in the portal (**Deep dive → Evidently reports**), stored in MLflow/MinIO | portal login |
+| Prefect | http://localhost:4200 | – |
+| MinIO console | http://localhost:9001 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
+| Prediction API | http://localhost:8000 (`/health`, `/metrics`, `/docs`) | – |
+| Demo alert receiver | http://localhost:8020/alerts | – |
+
+`.env.example` ships **demo-only** values (`demo-change-me`). `.env` is git-ignored; no secret lives in the repository.
+Change every password before exposing a port beyond localhost.
+
+## The story (Streamlit pages)
+
+Each page follows the same rhythm: **story → trigger → monitoring (what the numbers say) → observability (why)**.
+Use *Start here → Reset to a healthy baseline* between stories.
+
+| Page | You do | You see | Alert |
+|---|---|---|---|
+| 1 · A normal day | quote a fare | RED metrics; the request's own log line via its `request_id` | none |
+| 2 · A slow service | inject 1.5 s latency | p50/p95/p99 vs the 1 s line, slowest traces, slow log lines | `HighLatencyP99` |
+| 3 · Data drift | run the pipeline on shifted data | PSI per feature vs threshold, dataset flag | `DataDriftDetected` |
+| 4 · Bad data | raise the share of invalid requests | 422s climb, 5xx stays 0; logs name the fields | none (on purpose) |
+| 5 · An outage | stop the API | `up`→0, then the cascade: `ModelNotLoaded`, `BusinessThroughputLow` turn red; only `ServiceDown` notifies (inhibition) | `ServiceDown` (+ cascade) |
+| 6 · Model quality | real fares jump +100% | online RMSE vs validation RMSE | `OnlineModelErrorHigh` |
+| 7 · Business impact | traffic collapses | quotes/min and revenue/min | `BusinessThroughputLow` |
+
+The portal has a light and a dark theme: it follows the system setting, and the switch at the bottom of the sidebar overrides it (embedded Grafana panels follow). Fonts are self-hosted, so the interface needs no internet access.
+
+Other sections: **Observe** (alerts & notifications, logs & traces, Grafana dashboards) and **Deep dive**
+(Prefect, MLflow, Evidently, Prometheus, Alertmanager, manual prediction) keep the full tools one click away through iframes.
+
+## Scripted scenarios (no browser needed)
+
+```bash
+make demo-normal       # normal traffic → no alert for 90 s
+make demo-latency      # HighLatencyP99
+make demo-drift        # DataDriftDetected
+make demo-outage       # ServiceDown
+make demo-performance  # OnlineModelErrorHigh (bonus)
+make demo-business     # BusinessThroughputLow (bonus)
+```
+
+Each script injects the fault, queries the Prometheus and Alertmanager APIs and the webhook, prints the measured delay
+(seconds since injection), removes the fault and waits for the alert to resolve.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User((Presenter)) --> Portal["Streamlit :8501"]
+    Portal -->|controls| Sim[Load simulator]
+    Portal -->|latency injection| API
+    Portal -->|stop/start| Ctl[Controller]
+    Portal -->|run pipeline| Prefect
+    Sim -->|traffic + delayed labels| API["Prediction API :8000"]
+    API -->|/metrics| Prom[Prometheus]
+    API -->|JSON logs| Loki
+    API -->|OTLP spans| Tempo
+    Prefect["Prefect server + Docker worker"] -->|flow container| Flow["Flow: ingest → validate → drift → train"]
+    Flow -->|rows, quarantine| PG[(PostgreSQL)]
+    Flow -->|models, reference, reports| MLflow --> MinIO[(MinIO)]
+    Flow -->|drift, RMSE| Push[Pushgateway] --> Prom
+    API -->|champion alias| MLflow
+    Prom --> Rules{{Alert rules}} --> AM[Alertmanager] -->|webhook| Hook[Demo receiver]
+    Prom --> Graf[Grafana]
+    Loki --> Graf
+    Tempo --> Graf
+```
+
+### Observability circuits
+
+```mermaid
+flowchart LR
+    API[Prediction API] -->|"/metrics (every 5 s)"| Prom[Prometheus]
+    Flow[Pipeline container] -->|"last drift / RMSE"| Push[Pushgateway] --> Prom
+    Prom -->|rules, for: duration| AM[Alertmanager] -->|webhook| Notif[Notification]
+    Docker[Container stdout] --> Promtail --> Loki
+    API -->|spans| Tempo
+    Grafana --> Prom & Loki & Tempo
+```
+
+Logs and metrics are linked by the **`request_id`** (returned in the `X-Request-ID` response header, present in every
+log line with `trace_id` and `model_version`). Loki labels stay low-cardinality; ids are fields inside the JSON line.
+
+### Pipeline (Prefect flow `nyc-taxi-demo`)
+
+```mermaid
+flowchart TB
+    In["year, month, limit, simulate_drift"] --> Download[Download TLC Parquet]
+    Download --> Validate{"pandera schema: types, bounds, nulls"}
+    Validate -->|bad rows| Quarantine[(quarantine_trips + reason)]
+    Validate -->|"> 20% bad"| Fail[Flow fails loudly]
+    Validate -->|valid rows| Store[(training_trips, idempotent batch key)]
+    Store --> Drift["PSI / KS per feature vs the champion's frozen reference<br/>thresholds: config/monitoring.yml"]
+    Drift --> Train[Train candidate, score candidate AND champion on the same validation split]
+    Train --> Register[Register version, log reference + SHA-256 + drift summary]
+    Register --> Promote{Better RMSE?}
+    Promote -->|yes| Champion[Move alias champion]
+    Promote -->|no| Keep[Keep champion]
+    Champion --> Push[Publish metrics to Pushgateway]
+    Keep --> Push
+```
+
+### Prediction and delayed labels
+
+```mermaid
+sequenceDiagram
+    participant C as Client / simulator
+    participant A as Prediction API
+    participant M as MLflow
+    A->>M: every 60 s: resolve NYC_Taxi_Fare_Model@champion (reload if new)
+    C->>A: POST /fare_predict
+    alt invalid input
+        A-->>C: 422 (fields only), counted + logged
+    else no model
+        A-->>C: 503
+    else ok
+        A-->>C: predicted_fare + X-Request-ID
+    end
+    Note over C: later, the real fare is known
+    C->>A: POST /feedback {request_id, actual_fare}
+    A->>A: online RMSE counters updated
+```
+
+## What is monitored, and where it is defined
+
+| Concern | Where |
+|---|---|
+| RED metrics, latency histogram (p50/p95/p99), bounded labels | `services/prediction_api/app.py` |
+| Real `/health` (loads model **and** runs a smoke prediction) | same file, `GET /health` |
+| Input validation (API) | Pydantic bounds → 422 + `invalid_requests_total` |
+| Input validation (batch) | `services/pipeline/taxi_validation.py` (pandera), bad rows quarantined |
+| Drift thresholds | `config/monitoring.yml` (PSI ≥ 0.2, KS ≥ 0.2, ≥ 30% features) |
+| Frozen reference | MLflow artifact of the champion run + `reference_sha256` tag |
+| Alert rules | `services/prometheus/alert_rules.yml`, unit-tested with promtool |
+| Runbooks | `docs/RUNBOOKS.md` (each alert links to its section) |
+| Alert routing | `services/alertmanager/alertmanager.yml` → demo webhook |
+| Dashboards (provisioned from files) | `services/grafana/dashboards/` — **L0 “Is it OK?”** first, then L1/L2/L3 |
+| Portal design system | `services/frontend/theme.css` (tokens), `ui.py` (components), `.streamlit/config.toml` (Streamlit themes, chart palette) |
+| Scrape interval | 5 s (demo choice; rule windows are 1 m, ≥ 12× the interval) |
+
+There is no LLM/RAG component in the platform itself.
+
+## Tests
+
+Three levels, from the cheapest to the most realistic:
+
+| Level | Needs | Where | Command |
+| --- | --- | --- | --- |
+| Unit | Python only | `tests/` | `make test` |
+| Integration | One or a few real dependencies (for example PostgreSQL, MLflow, promtool) started for the test | to be written | to be defined by the team |
+| End-to-end | The full stack (`make up`) | `tests/test_integration.py` (marker `e2e`) | `uv run --no-sync pytest -m e2e` |
+
+```bash
+uv sync --frozen --all-groups
+make test        # unit tests; end-to-end tests are skipped when the stack is not running
+make coverage    # same, with branch coverage of services/
+```
+
+Baseline of the shipped suite (`v1.0`): 10 unit tests pass, 2 end-to-end tests are skipped without the stack, and branch coverage of `services/` is **16%** (`taxi_drift` 100%, `prediction_api` 69%, `taxi_validation` 67%, `flow` 32%, every other module 0%).
+
+## Fault-injection endpoints (demo only)
+
+`PUT /admin/chaos` on the API adds artificial latency and is **disabled unless `CHAOS_ENABLED=true`**.
+The `controller` service can only stop/start `prediction_api` (allow-list) through the Docker socket, and publishes no port.
+Do not ship either to a real environment.
+
+## Notes and limits
+
+- Pushgateway keeps the last pipeline result, so drift/RMSE gauges describe the **last run**, not "now". The drift alert clears after a run without drift.
+- Delayed labels in the demo are **synthetic** (prediction + noise, plus bias when triggered).
+- Random 80/20 validation is fine for a demo; a real project should use a temporal split.
+- Dashboard viewers are anonymous and Streamlit login protects the portal only, not the direct ports.
+- Embedded tools open on the host typed in the browser, so `http://localhost:8501` and `http://<vm-ip>:8501` both work without any setting. `PUBLIC_HOST` in `.env` forces one address if needed.
+- On a VM, open only ports 8501, 3000, 4200, 5000, 9090 and 9093 to your own IP, and change the passwords in `.env` first. Prometheus, Prefect and the other tools have no login, and the Compose file also publishes Postgres, MinIO and the API (with `/admin/chaos`) on all interfaces.
